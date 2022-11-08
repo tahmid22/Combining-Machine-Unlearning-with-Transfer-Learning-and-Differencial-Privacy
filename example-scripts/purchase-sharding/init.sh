@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cp -r ../../datasets .
+
 set -eou pipefail
 IFS=$'\n\t'
 
