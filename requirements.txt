@@ -2,3 +2,5 @@ numpy
 torch
 sklearn
 pandas
+torchvision
+mlxtend
