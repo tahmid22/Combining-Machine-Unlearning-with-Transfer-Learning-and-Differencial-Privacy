@@ -4,6 +4,7 @@ import collections
 from opacus import PrivacyEngine
 from opacus.validators import ModuleValidator
 
+import utils
 import time
 import datetime
 import mlxtend
@@ -21,6 +22,8 @@ from torch.utils.data import DataLoader
 # import resnet as models
 from torchvision.models import resnet18
 import copy
+
+from utils import SaveFile
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", DEVICE)
@@ -51,6 +54,8 @@ class SISA:
             # Initial fit without unlearning requests
             flag = not np.any(unlearn_requests)
             if flag:
+                top1_val_accs_list = []
+                top1_test_acc_list = []
                 for shard_i, shard_train_dataset in enumerate(self.shard_train_dataset_arr):
                     if self.slices == 0:
                         print("Traing Shard_{}-------------------------------\n\
@@ -71,22 +76,34 @@ class SISA:
                         # Step-3: Train the model epoch-times and keep track of best accuracy
                         best_acc = 0
                         best_model_wts = None
+                        top1_val_accs = []
                         for epoch_i in range(epochs):
                             print(f"Epoch {epoch_i+1}\n-------------------------------")
                             self.train(train_dataloader, model, loss_fn, optimizer, scheduler)
                             epoch_acc = self.evaluate(val_dataloader, model, loss_fn, 'Validation')
+                            top1_val_accs.append(epoch_acc)
                             if best_acc < epoch_acc:
                                 best_acc = epoch_acc
                                 best_model_wts = copy.deepcopy(model.state_dict())
                         print("Done traing shard_{}".format(shard_i))
 
                         model.load_state_dict(best_model_wts)
-                        self.evaluate(test_dataloader, model, loss_fn, 'Test')
+                        top1_test_acc = self.evaluate(test_dataloader, model, loss_fn, 'Test')
+
+                        top1_val_accs_list.append(top1_val_accs)
+                        top1_test_acc_list.append(top1_test_acc)
+                        self.estimators.append(best_model_wts)
 
                     # Not experimenting with slicing
                     else:
                         print("Slicing not suppoted")
                         break
+
+                save_file = SaveFile(self.shards, epsilon, fine_tune_percent, fine_tune_method, top1_val_accs_list, top1_test_acc_list, self.estimators)
+                save_name = 'results_shards' + str(self.shards) + '_epsilon' + str(epsilon) + '_finetunepercent' + str(fine_tune_percent) + '_finetunemethod' + str(fine_tune_method)
+                utils.save(save_file, save_name)
+                #loaded = utils.load(save_name)
+                #print(loaded.top1_val_accs_list)
 
             # Case for retraining only the affected shards
             else:
