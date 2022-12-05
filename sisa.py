@@ -1,5 +1,9 @@
 import numpy as np 
 import collections
+
+from opacus import PrivacyEngine
+from opacus.validators import ModuleValidator
+
 import time
 import datetime
 import mlxtend
@@ -62,7 +66,7 @@ class SISA:
                         test_dataloader = DataLoader(self.test_dataset, batch_size=batch_size, num_workers=workers, pin_memory=False)
                         
                         # Step-2: Create the model and other releated variables
-                        model, loss_fn, optimizer, scheduler = self.create_model(epsilon, fine_tune_percent, fine_tune_method, batch_size)
+                        model, loss_fn, optimizer, scheduler, train_dataloader = self.create_model(train_dataloader, epsilon, fine_tune_percent, fine_tune_method, batch_size)
                         
                         # Step-3: Train the model epoch-times and keep track of best accuracy
                         best_acc = 0
@@ -151,17 +155,62 @@ class SISA:
                                 self.estimators[i] = naive_b_wlearner
                 '''
 
-    def create_model(self, epsilon, fine_tune_percent, fine_tune_method, epochs):
-        model = resnet18(weights=None)
+    def create_model(self, train_dataloader, epsilon, fine_tune_percent, finetune_method, epochs):
+        # Create model
+        model = resnet18(weights=None, num_classes=100)
+        model = ModuleValidator.fix(model)  # BatchNorm -> GroupNorm
+        model.load_state_dict(torch.load('pre-trained-model-gn-bs512-acc40'))  # TODO
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features=in_features, out_features=10, bias=True)
+
+        for idx, (name, param) in enumerate(model.named_parameters()):
+            param.requires_grad = False
+            if 'conv' in name:
+                pass  # TODO
+            elif 'bn' in name:
+                if finetune_method >= 2:
+                    param.requires_grad = True
+            elif 'fc' in name:
+                if finetune_method >= 1:
+                    param.requires_grad = True
+
         torch.nn.DataParallel(model).cuda()
         model = torch.nn.DataParallel(model).cuda()
+
+        # Create loss function
         loss_fn = nn.CrossEntropyLoss().cuda()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=0.0001)
+
+        # Create optimizer
+        fc_layer_names = ['fc.weight', 'fc.bias']
+        non_fc_params = [x[1] for x in list(filter(lambda kv: kv[0] not in fc_layer_names, model.named_parameters()))]
+        fc_params = [x[1] for x in list(filter(lambda kv: kv[0] in fc_layer_names, model.named_parameters()))]
+
+        optimizer = torch.optim.SGD([
+            {'params': non_fc_params},
+            {'params': fc_params, 'lr': 0.8}
+        ], lr=0.01, momentum=0.9)
+
+        # Create scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-        return model, loss_fn, optimizer, scheduler
+
+        # Make private
+        privacy_engine = PrivacyEngine()
+        model, optimizer, train_dataloader = privacy_engine.make_private_with_epsilon(
+            module=model,
+            optimizer=optimizer,
+            data_loader=train_dataloader,
+            target_epsilon=epsilon,
+            target_delta=0.00001,
+            epochs=epochs,
+            # noise_multiplier=15.0,
+            max_grad_norm=1.0
+        )
+
+        return model, loss_fn, optimizer, scheduler, train_dataloader
 
     # def train(train_loader, model, criterion, optimizer, epoch):
     def train(self, dataloader: DataLoader, model, loss_fn, optimizer: torch.optim.Optimizer, scheduler):
+        print("Learning rate:", scheduler.get_last_lr())
         size = len(dataloader.dataset)
         model.train()
         for batch, (X, y) in enumerate(dataloader):

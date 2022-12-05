@@ -16,12 +16,13 @@ import torchvision.datasets as datasets
 from torchvision.datasets import CIFAR100
 import torchvision.transforms as tt
 from torchvision.transforms import ToTensor
-import resnet as models
+#import resnet as models
 from sisa import SISA
 import numpy as np
 
 torch.cuda.empty_cache()
 
+'''
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -67,10 +68,11 @@ parser.add_argument('--group-norm', default=0, type=int,
                     'batch norm instead of group-norm')
 parser.add_argument('--shards', default=1, type=int,
                     help='number of chards')
+'''
 
 def main():
     global args
-    args = parser.parse_args()
+    #args = parser.parse_args()
 
     cudnn.benchmark = True
 
@@ -86,23 +88,23 @@ def main():
         tt.ToTensor(),
     ])
 
-    train_dataset = datasets.CIFAR100(
+    train_dataset = datasets.CIFAR10(
         root='./data',
         train=True,
         download=True,
-        transform=train_transform,
+        transform=tt.ToTensor(),
     )
 
-    val_test_dataset = datasets.CIFAR100(
+    val_test_dataset = datasets.CIFAR10(
         root='./data',
         train=False,
         download=True,
-        transform=val_transform,
+        transform=tt.ToTensor(),
     )
 
     val_dataset, test_dataset = torch.utils.data.random_split(val_test_dataset, [5000, 5000])
 
-    sisa_1 = SISA(train_dataset, val_dataset, test_dataset, 10)
+    sisa_1 = SISA(train_dataset, val_dataset, test_dataset, shards=10)
     sisa_1.fit(epsilon=3, fine_tune_percent=1, fine_tune_method=1, batch_size=128, epochs=200, workers=16)
 
 
