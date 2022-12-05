@@ -56,6 +56,8 @@ class SISA:
             if flag:
                 top1_val_accs_list = []
                 top1_test_acc_list = []
+                top5_val_accs_list = []
+                top5_test_acc_list = []
                 for shard_i, shard_train_dataset in enumerate(self.shard_train_dataset_arr):
                     if self.slices == 0:
                         print("Traing Shard_{}-------------------------------\n\
@@ -77,21 +79,25 @@ class SISA:
                         best_acc = 0
                         best_model_wts = None
                         top1_val_accs = []
+                        top5_val_accs = []
                         for epoch_i in range(epochs):
                             print(f"Epoch {epoch_i+1}\n-------------------------------")
                             self.train(train_dataloader, model, loss_fn, optimizer, scheduler)
-                            epoch_acc = self.evaluate(val_dataloader, model, loss_fn, 'Validation')
-                            top1_val_accs.append(epoch_acc)
-                            if best_acc < epoch_acc:
-                                best_acc = epoch_acc
+                            epoch_acc_top1, epoch_acc_top5 = self.evaluate(val_dataloader, model, loss_fn, 'Validation')
+                            top1_val_accs.append(epoch_acc_top1)
+                            top5_val_accs.append(epoch_acc_top5)
+                            if best_acc < epoch_acc_top1:
+                                best_acc = epoch_acc_top1
                                 best_model_wts = copy.deepcopy(model.state_dict())
                         print("Done traing shard_{}".format(shard_i))
 
                         model.load_state_dict(best_model_wts)
-                        top1_test_acc = self.evaluate(test_dataloader, model, loss_fn, 'Test')
+                        top1_test_acc, top5_test_acc = self.evaluate(test_dataloader, model, loss_fn, 'Test')
 
                         top1_val_accs_list.append(top1_val_accs)
                         top1_test_acc_list.append(top1_test_acc)
+                        top5_val_accs_list.append(top5_val_accs)
+                        top5_test_acc_list.append(top5_test_acc)
                         self.estimators.append(best_model_wts)
 
                     # Not experimenting with slicing
@@ -99,11 +105,12 @@ class SISA:
                         print("Slicing not suppoted")
                         break
 
-                save_file = SaveFile(self.shards, epsilon, fine_tune_percent, fine_tune_method, top1_val_accs_list, top1_test_acc_list, self.estimators)
+                save_file = SaveFile(self.shards, epsilon, fine_tune_percent, fine_tune_method, top1_val_accs_list, top1_test_acc_list, top5_val_accs_list, top5_test_acc_list, self.estimators)
                 save_name = 'results_shards' + str(self.shards) + '_epsilon' + str(epsilon) + '_finetunepercent' + str(fine_tune_percent) + '_finetunemethod' + str(fine_tune_method)
                 utils.save(save_file, save_name)
                 #loaded = utils.load(save_name)
                 #print(loaded.top1_val_accs_list)
+                #print(loaded.top5_val_accs_list)
 
             # Case for retraining only the affected shards
             else:
@@ -253,16 +260,19 @@ class SISA:
         num_batches = len(dataloader)
         model.eval()
         test_loss, correct = 0, 0
+        top1 = AverageMeter()
+        top5 = AverageMeter()
         with torch.no_grad():
             for X, y in dataloader:
                 X, y = X.cuda(non_blocking=True), y.cuda(non_blocking=True)
                 pred = model(X)
+                prec1, prec5 = accuracy(pred.data, y, topk=(1, 5))
+                top1.update(prec1[0], X.size(0))
+                top5.update(prec5[0], X.size(0))
                 test_loss += loss_fn(pred, y).item()
-                correct += (pred.argmax(1) == y).type(torch.float).sum().item()
         test_loss /= num_batches
-        correct /= size
-        print(f"{output_name} Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
-        return correct
+        print(f"{output_name} Error: \n Accuracy: {top1.avg.item() :>0.1f}% | {top5.avg.item() :>0.1f}%, Avg loss: {test_loss:>8f} \n")
+        return top1.avg.item(), top5.avg.item()
 
     def predict(self, X_test, X_train_copy, y_train_copy): # Sort of the aggregation method
         #y_test_hats = np.empty((len(self.nb_learners), len(X_test)))
