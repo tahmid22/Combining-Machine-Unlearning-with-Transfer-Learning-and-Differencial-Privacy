@@ -1,4 +1,6 @@
-import numpy as np 
+import math
+
+import numpy as np
 import collections
 
 from opacus import PrivacyEngine
@@ -45,6 +47,8 @@ class SISA:
         self.shard_train_dataset_arr = torch.utils.data.random_split(self.train_dataset, shard_size_arr)
         self.affected_shards = []
 
+        self.masks = {}
+
     def gen_random_seq(self, size): # sequence to delete random rows in our data
         delete_rows = np.random.choice(range(self.N), size=(size, 1), replace=False) # range start, stop + 1; # Max number of rows we can delete
         return delete_rows
@@ -82,7 +86,7 @@ class SISA:
                         top5_val_accs = []
                         for epoch_i in range(epochs):
                             print(f"Epoch {epoch_i+1}\n-------------------------------")
-                            self.train(train_dataloader, model, loss_fn, optimizer, scheduler)
+                            self.train(train_dataloader, model, loss_fn, optimizer, scheduler, fine_tune_method)
                             epoch_acc_top1, epoch_acc_top5 = self.evaluate(val_dataloader, model, loss_fn, 'Validation')
                             top1_val_accs.append(epoch_acc_top1)
                             top5_val_accs.append(epoch_acc_top5)
@@ -187,10 +191,26 @@ class SISA:
         in_features = model.fc.in_features
         model.fc = nn.Linear(in_features=in_features, out_features=10, bias=True)
 
-        for idx, (name, param) in enumerate(model.named_parameters()):
+        for name, param in model.named_parameters():
             param.requires_grad = False
             if 'conv' in name:
-                pass  # TODO
+                if finetune_method >= 3:
+                    param.requires_grad = True
+                    total_param = torch.numel(param)
+                    total_to_finetune = math.ceil(total_param * fine_tune_percent / 100)
+                    values, indices = torch.topk(param.flatten(), total_to_finetune)
+
+                    mask_unfrozen = torch.zeros_like(param.flatten()).cuda()
+                    for i in indices:
+                        mask_unfrozen[i] = 1
+                    mask_unfrozen = torch.reshape(mask_unfrozen, param.shape)
+
+                    mask_frozen = torch.ones_like(param.flatten()).cuda()
+                    for i in indices:
+                        mask_frozen[i] = 0
+                    mask_frozen = torch.reshape(mask_frozen, param.shape)
+
+                    self.masks[name] = (mask_unfrozen, mask_frozen)
             elif 'bn' in name:
                 if finetune_method >= 2:
                     param.requires_grad = True
@@ -233,7 +253,7 @@ class SISA:
         return model, loss_fn, optimizer, scheduler, train_dataloader
 
     # def train(train_loader, model, criterion, optimizer, epoch):
-    def train(self, dataloader: DataLoader, model, loss_fn, optimizer: torch.optim.Optimizer, scheduler):
+    def train(self, dataloader: DataLoader, model, loss_fn, optimizer: torch.optim.Optimizer, scheduler, fine_tune_method):
         print("Learning rate:", scheduler.get_last_lr())
         size = len(dataloader.dataset)
         model.train()
@@ -247,7 +267,25 @@ class SISA:
             # Backpropagation
             optimizer.zero_grad()
             loss.backward()
+
+            param_copies = {}
+            if fine_tune_method >= 3:
+                for name, param in model.named_parameters():
+                    if 'conv' in name:
+                        param_copies[name] = param.detach().clone()
+
             optimizer.step()
+
+            if fine_tune_method >= 3:
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if 'conv' in name:
+                            #print('Changed param', param.flatten()[0])
+                            mask_unfrozen, mask_frozen = self.masks[name[len('_module.module.'):]]
+                            param_copy = param_copies[name]
+                            #print('Unchanged param', param_copy.flatten()[0])
+                            param.copy_(torch.add(torch.mul(param, mask_unfrozen), torch.mul(param_copy, mask_frozen)))
+                            #print('New param', param.flatten()[0], '\n')
 
             if batch % 100 == 0:
                 loss, current = loss.item(), batch * len(X)
