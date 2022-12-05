@@ -13,7 +13,7 @@ class SaveFile:
 
 
 def save(object, name):
-    file = open(name, 'ab')
+    file = open(name, 'wb')
     pickle.dump(object, file)
     file.close()
 
