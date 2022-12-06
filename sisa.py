@@ -26,6 +26,7 @@ from torchvision.models import resnet18
 import copy
 
 from utils import SaveFile
+from utils_agg_pred import SaveFileAgg
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", DEVICE)
@@ -42,12 +43,28 @@ class SISA:
         self.estimators = []
         self.slices = slices
 
+        self.val_dataloader = None
+        self.test_dataloader = None
+
+        self.epsilon = None
+        self.fine_tune_method = None
+        self.fine_tune_percent = None
+        self.batch_size = None
+        self.epochs = None
+
         self.shard_size = self.N//self.shards
         shard_size_arr = [self.shard_size]*self.shards
         self.shard_train_dataset_arr = torch.utils.data.random_split(self.train_dataset, shard_size_arr)
         self.affected_shards = []
 
         self.masks = {}
+
+    def set_hyperparameters(self, epsilon, fine_tune_percent, fine_tune_method, batch_size, epochs):
+        self.epsilon = epsilon
+        self.fine_tune_method = fine_tune_method
+        self.fine_tune_percent = fine_tune_percent
+        self.batch_size = batch_size
+        self.epochs = epochs
 
     def gen_random_seq(self, size): # sequence to delete random rows in our data
         delete_rows = np.random.choice(range(self.N), size=(size, 1), replace=False) # range start, stop + 1; # Max number of rows we can delete
@@ -58,6 +75,16 @@ class SISA:
             # Initial fit without unlearning requests
             flag = not np.any(unlearn_requests)
             if flag:
+                self.epsilon = epsilon
+                self.fine_tune_method = fine_tune_method
+                self.fine_tune_percent = fine_tune_percent
+                self.batch_size = batch_size
+                self.epochs = epochs
+
+                # Test and val datasets are constants
+                self.test_dataloader = DataLoader(self.test_dataset, batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=False)
+                self.val_dataloader = DataLoader(self.val_dataset, batch_size=batch_size, num_workers=workers, pin_memory=False)
+
                 top1_val_accs_list = []
                 top1_test_acc_list = []
                 top5_val_accs_list = []
@@ -87,7 +114,7 @@ class SISA:
                         for epoch_i in range(epochs):
                             print(f"Epoch {epoch_i+1}\n-------------------------------")
                             self.train(train_dataloader, model, loss_fn, optimizer, scheduler, fine_tune_method)
-                            epoch_acc_top1, epoch_acc_top5 = self.evaluate(val_dataloader, model, loss_fn, 'Validation')
+                            epoch_acc_top1, epoch_acc_top5 = self.evaluate(self.val_dataloader, model, loss_fn, 'Validation')
                             top1_val_accs.append(epoch_acc_top1)
                             top5_val_accs.append(epoch_acc_top5)
                             if best_acc < epoch_acc_top1:
@@ -96,7 +123,7 @@ class SISA:
                         print("Done traing shard_{}".format(shard_i))
 
                         model.load_state_dict(best_model_wts)
-                        top1_test_acc, top5_test_acc = self.evaluate(test_dataloader, model, loss_fn, 'Test')
+                        top1_test_acc, top5_test_acc = self.evaluate(self.test_dataloader, model, loss_fn, 'Test')
 
                         top1_val_accs_list.append(top1_val_accs)
                         top1_test_acc_list.append(top1_test_acc)
@@ -118,70 +145,7 @@ class SISA:
 
             # Case for retraining only the affected shards
             else:
-                '''
-                Skipping for now
-                '''
-                '''
-                for x_shard, y_shard in zip(x_shards, y_shards):
-                    bool_val = False
-                    for item in x_shard:
-                        for unlearn_request in unlearn_requests:
-                            if unlearn_request[0] == item:
-                                bool_val = True
-                    if bool_val:
-                        self.affected_shards.append(x_shard)
-                affected_shards_x = np.array(self.affected_shards)
-
-                for i, (x_shard,y_shard) in enumerate(zip(x_shards, y_shards)):
-                    flag = False
-                    for aff_x_shard in affected_shards_x:
-                        if flag == True:
-                            continue
-                        elif np.array_equal(x_shard,aff_x_shard) != True:
-                            for j in range(self.slices):
-                                self.dict_train_time[i][j] = 0
-                            continue
-                        else:
-                            flag = True
-                            naive_b_wlearner = CategoricalNB(min_categories=256)
-                            if self.slices == None:
-                                start = datetime.datetime.now()
-                                X_train_copy = np.copy(self.X_train)
-                                y_train_copy = np.copy(self.y_train)
-                                X_train_b_1 = X_train_copy[x_shard]
-                                y_train_b_1 = y_train_copy[y_shard]
-                                X_train_b = np.delete(X_train_b_1, x_shard, axis=0)
-                                if X_train_b.size == 0:
-                                    y_train_b = np.delete(y_train_b_1, y_shard)
-                                    self.estimators.pop(i)
-                                    continue
-                                y_train_b = np.delete(y_train_b_1, y_shard, axis=0)
-                                naive_b_wlearner.fit(X_train_b, y_train_b)
-                                end = datetime.datetime.now()
-                                diff = (end -start)
-                                execution_time = diff.total_seconds() * 1000
-                                self.dict_train_time[i] = execution_time
-                                self.nb_learners[i] = naive_b_wlearner
-                            else:
-                                slices_in_x_shard = np.array_split(x_shard, self.slices) # slight innaccuracy because array_split will in some cases remove a tiny bit of data on the split; negligible
-                                slices_in_y_shard = np.array_split(y_shard, self.slices)
-                                # Currently in one slice at each shard 
-                                for unlearn_request in unlearn_requests:
-                                    for j, (x_ind_slice, y_ind_slice) in enumerate(zip(slices_in_x_shard, slices_in_y_shard)):
-                                        start = datetime.datetime.now()
-                                        if unlearn_request in x_ind_slice: # just omit the slice from the training of our model!!!!!
-                                            self.dict_train_time[i][j] = 0
-                                            continue          
-                                        else: # feeding slices that are not in the unlearn request to our model
-                                            X_train_slice = self.X_train[x_ind_slice]
-                                            y_train_slice = self.y_train[y_ind_slice]
-                                            naive_b_wlearner.partial_fit(X_train_slice, y_train_slice, classes=np.unique(y_train_slice))
-                                        end = datetime.datetime.now()
-                                        diff = (end -start)
-                                        execution_time = diff.total_seconds() * 1000
-                                        self.dict_train_time[i][j] = execution_time
-                                self.estimators[i] = naive_b_wlearner
-                '''
+                print("Unlearning not supported")
 
     def create_model(self, train_dataloader, epsilon, fine_tune_percent, finetune_method, epochs):
         # Create model
@@ -238,16 +202,17 @@ class SISA:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
         # Make private
-        privacy_engine = PrivacyEngine()
-        model, optimizer, train_dataloader = privacy_engine.make_private_with_epsilon(
-            module=model,
-            optimizer=optimizer,
-            data_loader=train_dataloader,
-            target_epsilon=epsilon,
-            target_delta=0.00001,
-            epochs=epochs,
-            # noise_multiplier=15.0,
-            max_grad_norm=1.0
+        if epsilon != 0:
+            privacy_engine = PrivacyEngine()
+            model, optimizer, train_dataloader = privacy_engine.make_private_with_epsilon(
+                module=model,
+                optimizer=optimizer,
+                data_loader=train_dataloader,
+                target_epsilon=epsilon,
+                target_delta=0.00001,
+                epochs=epochs,
+                # noise_multiplier=15.0,
+                max_grad_norm=1.0
         )
 
         return model, loss_fn, optimizer, scheduler, train_dataloader
@@ -312,20 +277,64 @@ class SISA:
         print(f"{output_name} Error: \n Accuracy: {top1.avg.item() :>0.1f}% | {top5.avg.item() :>0.1f}%, Avg loss: {test_loss:>8f} \n")
         return top1.avg.item(), top5.avg.item()
 
-    def predict(self, X_test, X_train_copy, y_train_copy): # Sort of the aggregation method
-        #y_test_hats = np.empty((len(self.nb_learners), len(X_test)))
-        maj_vote = EnsembleVoteClassifier(clfs=self.estimators, voting='hard', fit_base_estimators=False) # Majority vote
-        maj_vote.fit(X_train_copy, y_train_copy)
-        for i in range(self.shards):
-            sum = 0 
-            for j in range(self.slices): # Sums up all the time it took to train each slice for our weak learner per shard
-                sum+=self.dict_train_time[i][j]
-            self.train_time_per_shard[i] = sum 
-        for i in range(self.shards):
-            print ('Execution time for training Shard %d : %d ms' %(i, self.train_time_per_shard[i]))
-        self.reset_time()
-        self.affected_shards = []
-        return maj_vote.predict(X_test)
+    def predict(self, weights): # Sort of the aggregation method
+        if len(weights) != len(self.shard_train_dataset_arr):
+            print("#wights != #shards")
+            return
+
+        correct = 0
+        correct_top_3 = 0
+        added_labels = False
+        label_lst = []              # sequence of labels
+        model_pred_vect_lst = []    # sequence of 
+
+        test_dataloader = DataLoader(self.test_dataset, batch_size=1, shuffle=False, pin_memory=False)      # Test dataloader
+
+        for shard_i, shard_train_dataset in enumerate(self.shard_train_dataset_arr):    # Go through each shard and load models
+            print("Loading model for shard_{}".format(shard_i))
+            train_dataloader = DataLoader(shard_train_dataset, batch_size=256, shuffle=True, num_workers=8, pin_memory=False)
+            model, loss_fn, optimizer, scheduler, my_train_dataloader = self.create_model(train_dataloader, self.epsilon, self.fine_tune_percent, self.fine_tune_method, self.epochs)
+            model.load_state_dict(weights[shard_i])
+
+            print("Evaluating model prediction")
+            pred_vector_arr = []    # To hold all predection vectors for inputs from Test-dataloader for current shard
+            for X, y in test_dataloader:
+                X, y = X.cuda(non_blocking=True), y.cuda(non_blocking=True)
+                label = y.detach().cpu().numpy()
+                if added_labels == False:
+                    label_lst.append(label[0])
+
+                model.eval()
+                pred = model(X)
+                prob_vector = torch.nn.functional.softmax(pred, dim=1)
+                prob_vector = prob_vector.detach().cpu().numpy()
+                pred_vector_arr.append(prob_vector) # Add pred vector for current input to shard's pred_vector_arr
+
+            if added_labels == False:
+                added_labels = True
+
+            model_pred_vect_lst.append(pred_vector_arr)                         # Add prediction vector array for each shard to model_pred_vect_lst
+        
+        model_pred_vect_lst = np.array(model_pred_vect_lst).sum(axis=0)     # Sum up the predictions for all shards
+
+        if len(label_lst) != len(model_pred_vect_lst):
+            print("len(label_lst) != len(model_pred_vect_lst)")
+
+        for label_i, label in enumerate(label_lst):
+            max_prob_idx = np.argmax(model_pred_vect_lst[label_i])
+            top_3_idx = (-model_pred_vect_lst[label_i]).argsort()[:3]
+            if label == max_prob_idx:
+                correct = correct + 1
+            if label in top_3_idx:
+                correct_top_3 = correct_top_3 + 1
+
+        top1_acc = correct/len(label_lst)*100
+        top3_acc = correct_top_3/len(label_lst)*100
+
+        save_file = SaveFileAgg(self.shards, self.epsilon, self.fine_tune_percent, self.fine_tune_method, top1_acc, top3_acc)
+        save_file.saveAgg()
+
+        return top1_acc, top3_acc
     
     def reset_time(self):
         for i in range(self.shards):
